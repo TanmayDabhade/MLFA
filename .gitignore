@@ -1,0 +1,47 @@
+# Env files (secrets)
+.env
+data-acq/.env
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtualenvs / environments
+.venv/
+venv/
+env/
+ENV/
+.idea/
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Mac / OS files
+.DS_Store
+
+# Logs
+*.log
+
+# Data (raw snapshots, structured outputs) — ignore large datasets and generated parquet
+# Keep these ignored so you don't accidentally commit big binary data
+data/
+data-acq/data/
+
+# Model artifacts (trained models, pickles, joblib, saved boosters, metadata files)
+# If you prefer to version models, remove or narrow these.
+models/**/preprocessor.joblib
+models/**/lgbm_*.txt
+models/**/lgbm_q*.txt
+models/**/metadata.json
+models/**/__pycache__/
+
+# Joblib / caches / artifacts
+*.joblib
+*.parquet
+*.pickle
+*.pkl
+
+# Misc
+.terraform/
