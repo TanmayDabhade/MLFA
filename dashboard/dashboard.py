@@ -6,11 +6,16 @@
 
 import json, os, re, glob
 from typing import Dict, List, Optional, Tuple
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+import importlib.util
+from joblib import load as joblib_load
+import lightgbm as lgb
+import simulations  # Import sibling module
 
 # ----------------------------
 # Config & small utilities
@@ -159,9 +164,79 @@ def _merge_for_display(ticker: str, income: pd.DataFrame, cash: pd.DataFrame) ->
             df = cash[["fiscalDateEnding"]].copy()
         df = df.merge(cash[["fiscalDateEnding","operatingCashflow","capitalExpenditures","freeCashFlow"]],
                       on="fiscalDateEnding", how="outer")
-    if not df.empty:
-        df["ticker"] = ticker
+    if df.empty:
+        return df
+    if "fiscalDateEnding" not in df.columns:
+        return pd.DataFrame()
+    df["ticker"] = ticker
     return df.sort_values("fiscalDateEnding")
+
+# ----------------------------
+# Model A utilities (import on demand)
+# ----------------------------
+def _load_model_a_module() -> Optional[object]:
+    path = Path("models/model-A/model_a.py")
+    if not path.exists():
+        return None
+    spec = importlib.util.spec_from_file_location("model_a_dash", path)
+    if not spec or not spec.loader:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore
+    return mod
+
+@st.cache_data(show_spinner=False)
+def _load_model_a_predictions(data_root: str, snapshot: str, tickers: Tuple[str, ...], period: str):
+    mod = _load_model_a_module()
+    if not mod:
+        raise RuntimeError("Model A file not found.")
+    os.environ["RAW_DIR"] = data_root
+    df = mod.predict_latest(snapshot=snapshot, tickers=list(tickers), period=period)
+    return df
+
+def _load_model_a_drivers(data_root: str, snapshot: str, ticker: str, period: str) -> Optional[pd.DataFrame]:
+    """
+    Returns top feature contributions for the ticker's latest row (q50 model).
+    Uses LightGBM pred_contrib (TreeSHAP) for transparency.
+    """
+    mod = _load_model_a_module()
+    if not mod:
+        return None
+    meta_path = Path("models/model_a") / snapshot / "metadata.json"
+    pre_path = Path("models/model_a") / snapshot / "preprocessor.joblib"
+    model_path = Path("models/model_a") / snapshot / "lgbm_q50.txt"
+    if not (meta_path.exists() and pre_path.exists() and model_path.exists()):
+        return None
+
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    feature_names: List[str] = meta.get("features", [])
+    pre = joblib_load(pre_path)
+    booster = lgb.Booster(model_file=str(model_path))
+
+    # Build latest feature row for the ticker (reuse model_a helpers)
+    os.environ["RAW_DIR"] = data_root
+    stmts = mod._load_statements(Path(data_root), snapshot, ticker, period)
+    fx = mod._feature_frame(ticker, stmts)
+    if fx.empty:
+        return None
+    row = fx.sort_values("asof_date").iloc[-1:]
+    missing = [c for c in feature_names if c not in row.columns]
+    if missing:
+        return None
+    X = row[feature_names].copy()
+    Xn = pre.transform(X)
+    contrib = booster.predict(Xn, pred_contrib=True)
+    if contrib is None or len(contrib) == 0:
+        return None
+    # Last column is bias term
+    vals = contrib[0]
+    feat_contrib = pd.DataFrame({
+        "feature": feature_names + ["bias"],
+        "contribution": vals
+    })
+    feat_contrib["abs"] = feat_contrib["contribution"].abs()
+    top = feat_contrib.sort_values("abs", ascending=False).head(6)
+    return top[["feature","contribution"]]
 
 @st.cache_data(show_spinner=False)
 def load_all(data_root: str, snapshot: str, tickers: Tuple[str, ...], period: str):
@@ -173,6 +248,35 @@ def load_all(data_root: str, snapshot: str, tickers: Tuple[str, ...], period: st
     return bundles
 
 # ----------------------------
+# Model B utilities (Simulation)
+# ----------------------------
+def _load_model_b_module() -> Optional[object]:
+    path = Path("models/model-B/model_b.py")
+    if not path.exists():
+        return None
+    spec = importlib.util.spec_from_file_location("model_b_dash", path)
+    if not spec or not spec.loader:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+@st.cache_resource(show_spinner=False)
+def _load_model_b_resources(data_root: str, snapshot: str):
+    mod = _load_model_b_module()
+    if not mod:
+        return None
+    # Model B needs RAW_DIR env to be correct if it uses it internally, 
+    # though load_resources mostly reads from cache. 
+    # But just in case:
+    os.environ["RAW_DIR"] = data_root
+    try:
+        return mod.load_resources(snapshot)
+    except Exception as e:
+        st.error(f"Failed to load Model B resources: {e}")
+        return None
+
+# ----------------------------
 # UI
 # ----------------------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -182,8 +286,11 @@ with st.sidebar:
     st.markdown("**Data Source**")
     data_root = st.text_input("Data root", value=DEFAULT_DATA_ROOT)
     snap_default = _latest_snapshot(data_root) or ""
-    snapshot = st.text_input("Snapshot (YYYYMMDD or folder)", value=snap_default)
+    snapshot = st.text_input("Snapshot (YYYYMMDD or folder)", value=snap_default, key="snapshot_input_widget")
     period = st.radio("Period", options=("annual","quarterly"), index=1, horizontal=True)
+
+    # Mode Selector
+    view_mode = st.radio("Mode", options=("Standard Dashboard", "🔬 Simulation Lab"), index=0)
 
     # Tickerview
     available = _list_tickers(data_root, snapshot) if snapshot else []
@@ -203,6 +310,35 @@ if not tickers:
     st.stop()
 
 bundles = load_all(data_root, snapshot, tuple(tickers), period)
+
+# ---------------------------------
+# Dispatcher
+# ---------------------------------
+if view_mode == "🔬 Simulation Lab":
+    st.subheader("Interactive Simulation Lab")
+    
+    # Check Model B
+    mod_b = _load_model_b_module()
+    if not mod_b:
+        st.error("Model B (models/model-B/model_b.py) not found. Cannot run simulations.")
+        st.stop()
+        
+    # Load Resources
+    with st.spinner("Loading Model B artifacts..."):
+        res = _load_model_b_resources(data_root, snapshot)
+        
+    if not res:
+        st.warning(f"Could not load Model B artifacts for snapshot '{snapshot}'. Train the model first.")
+        st.info("Run: `python models/model-B/model_b.py train --snapshot <SNAPSHOT>`")
+        st.stop()
+        
+    # Selector for single ticker simulation
+    sim_ticker = st.selectbox("Select Ticker for Simulation", options=tickers)
+    
+    if sim_ticker:
+        simulations.render_what_if_analysis(mod_b, res, bundles, sim_ticker)
+        
+    st.stop()  # Stop here so we don't render standard dashboard below
 
 # ---------------------------------
 # Overview cards (Market Cap, P/E)
@@ -377,5 +513,80 @@ for t in tickers:
                                file_name=f"{t}_cashflow_{period}_{snapshot}.csv", mime="text/csv")
         else:
             st.info("No cashflow data.")
+
+# ---------------------------------
+# Model predictions & explainability (Model A)
+# ---------------------------------
+st.subheader("Model A Quantile Forecasts (12m return)")
+model_snap = snapshot  # reuse selected snapshot
+model_dir = Path("models/model_a") / model_snap
+if not model_dir.exists():
+    st.info(f"No Model A artifacts for snapshot {model_snap}. Train/predict first.")
+else:
+    try:
+        preds = _load_model_a_predictions(data_root, model_snap, tuple(tickers), period)
+    except Exception as e:
+        st.warning(f"Could not load predictions: {e}")
+        preds = None
+
+    if preds is not None and not preds.empty:
+        preds = preds.sort_values("ticker")
+
+        def _uncertainty_flag(width: float, all_widths: pd.Series) -> str:
+            if all_widths.empty or pd.isna(width):
+                return "unknown"
+            med = all_widths.median()
+            if width <= 0.5 * med:
+                return "narrow"
+            if width >= 1.5 * med:
+                return "wide"
+            return "normal"
+
+        widths = preds["p90_width"]
+        preds["uncertainty"] = [_uncertainty_flag(w, widths) for w in widths]
+
+        # Fan chart
+        fig = go.Figure()
+        for _, row in preds.iterrows():
+            t = row["ticker"]
+            x = [row["asof_date"]] * 5
+            y = [row["q5"], row["q25"], row["q50"], row["q75"], row["q95"]]
+            fig.add_trace(go.Scatter(
+                x=[row["asof_date"], row["asof_date"]],
+                y=[row["q25"], row["q75"]],
+                mode="lines",
+                line=dict(width=10, color="rgba(0,123,255,0.2)"),
+                showlegend=False,
+                hoverinfo="skip"
+            ))
+            fig.add_trace(go.Scatter(
+                x=x, y=y, mode="lines+markers",
+                name=t, line=dict(shape="hv"), marker=dict(size=6)
+            ))
+        fig.update_layout(
+            height=320, margin=dict(l=10,r=10,t=30,b=10),
+            yaxis_title="Expected 12m return", xaxis_title="As-of date",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.caption("Predictions are quantile bands (non-Gaussian). Width indicates uncertainty; not a bell curve.")
+        st.dataframe(preds[["ticker","asof_date","q5","q25","q50","q75","q95","p90_width","uncertainty"]]
+                           .rename(columns={"p90_width":"p90_width (spread)"}),
+                     use_container_width=True, hide_index=True)
+
+        # Explainability
+        sel = st.selectbox("Explain drivers for ticker", options=list(preds["ticker"]), key="xai_ticker")
+        drivers = _load_model_a_drivers(data_root, model_snap, sel, period)
+        if drivers is None or drivers.empty:
+            st.info("No feature contributions available. Ensure model files exist for this snapshot.")
+        else:
+            st.caption("Top contributors to median (q50) prediction — positive pushes up, negative pushes down.")
+            figc = px.bar(drivers.sort_values("contribution"), x="contribution", y="feature", orientation="h",
+                          color="contribution", color_continuous_scale=["#d62728","#2ca02c"])
+            figc.update_layout(height=320, margin=dict(l=10,r=10,t=30,b=10), coloraxis_showscale=False)
+            st.plotly_chart(figc, use_container_width=True)
+    else:
+        st.info("No predictions available for selected tickers/snapshot.")
 
 st.caption("V1 • Designed for unfiltered ingestion; downstream feature selection happens during training/FE.")

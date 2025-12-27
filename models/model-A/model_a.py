@@ -45,13 +45,18 @@ import lightgbm as lgb
 # ------------------------------
 # Config
 # ------------------------------
-RAW_DIR = Path(os.environ.get("RAW_DIR", "data-acq/data/raw"))
+# Default raw fundamentals root; override via RAW_DIR env if your data lives elsewhere
+RAW_DIR = Path(os.environ.get("RAW_DIR", "data/raw"))
 OUT_DIR = Path("data/structured")
 MODELS_DIR = Path("models/model_a")
 LABEL_HORIZON_TRADING_DAYS = 252      # ~12 months
 PUBLICATION_LAG_DAYS = 45             # conservative lag to avoid leakage
 QUANTILES = [0.05, 0.25, 0.50, 0.75, 0.95]
 RANDOM_STATE = 42
+
+def _pinball_loss(y_true: np.ndarray, y_pred: np.ndarray, tau: float) -> float:
+    e = y_true - y_pred
+    return float(np.mean(np.maximum(tau * e, (tau - 1) * e)))
 
 INCOME_KEYS_AV = [
     "totalRevenue","grossProfit","operatingIncome","netIncome",
@@ -211,6 +216,8 @@ def _feature_frame(ticker: str, stmts: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     df["debtToAssets"]     = df["longTermDebt"] / df["totalAssets"]
 
     # Cash & FCF
+    df["operatingCashflow"] = df.get("operatingCashflow", pd.Series(dtype=float))
+    df["capitalExpenditures"] = df.get("capitalExpenditures", pd.Series(dtype=float))
     df["freeCashFlow"]     = df["operatingCashflow"] - df["capitalExpenditures"]
     df["fcfMargin"]        = df["freeCashFlow"] / df["totalRevenue"]
     df["cashPctAssets"]    = (df["cashAndCashEquivalentsAtCarryingValue"].fillna(0.0) + df["shortTermInvestments"].fillna(0.0)) / df["totalAssets"]
@@ -375,7 +382,39 @@ def train_models(snapshot: str) -> Dict[str, str]:
     # simple time split: last 20% as validation (we still train models on full after basic sanity)
     cutoff = int(0.8 * Xn.shape[0])
     X_train, y_train = Xn[:cutoff], y[:cutoff]
+    X_valid, y_valid = Xn[cutoff:], y[cutoff:]
     X_full,  y_full  = Xn, y
+
+    # Quick pinball-loss sanity on 20% holdout before full training
+    if X_valid.shape[0] >= 20:
+        print("Validation (20% holdout) — pinball loss:")
+        base_params = {
+            "objective": "quantile",
+            "metric": "quantile",
+            "learning_rate": 0.05,
+            "num_leaves": 31,
+            "min_data_in_leaf": 50,
+            "feature_fraction": 0.8,
+            "bagging_fraction": 0.8,
+            "bagging_freq": 1,
+            "verbosity": -1,
+            "seed": RANDOM_STATE,
+        }
+        val_rows = []
+        for tau in QUANTILES:
+            params = dict(base_params, alpha=tau)
+            dtr = lgb.Dataset(X_train, label=y_train.values.astype(float))
+            dva = lgb.Dataset(X_valid, label=y_valid.values.astype(float), reference=dtr)
+            booster = lgb.train(
+                params, dtr, num_boost_round=1800,
+                valid_sets=[dva], valid_names=["valid"],
+                callbacks=[lgb.early_stopping(stopping_rounds=200), lgb.log_evaluation(period=0)],
+            )
+            pred = booster.predict(X_valid)
+            val_rows.append({"quantile": tau, "pinball_loss": _pinball_loss(y_valid.values.astype(float), pred, tau)})
+        val_df = pd.DataFrame(val_rows).sort_values("quantile")
+        with pd.option_context("display.max_rows", 10, "display.max_columns", 3, "display.width", 120):
+            print(val_df.to_string(index=False))
 
     models_paths = {}
     save_dir = MODELS_DIR / snapshot

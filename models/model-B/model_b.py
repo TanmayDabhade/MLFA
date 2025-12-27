@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Model A: Quantile Gradient Boosting (LightGBM)
-- Builds a leakage-safe dataset from raw fundamentals JSON (FMP / AlphaVantage).
+Model B: Quantile Gradient Boosting (LightGBM) with richer features + diagnostics
+- Builds a leakage-safe dataset from raw fundamentals JSON (FMP / AlphaVantage) + price momentum/vol.
 - Labels with 12m forward total return via Yahoo Finance (Adj Close).
-- Trains 5 quantile models (5/25/50/75/95th).
+- Trains 5 quantile models (5/25/50/75/95th) and emits training diagnostics/reports.
 - Predicts quantiles for latest fundamentals per ticker.
 
 Folder assumptions (from your ingestion):
   data/raw/<SNAPSHOT>/<TICKER>/{income_statement,balance_sheet,cashflow_statement,ratios,key_metrics,enterprise_values}.json
 
 Commands:
-  python model_a.py build-dataset --snapshot 20251022 --period quarterly
-  python model_a.py train --snapshot 20251022
-  python model_a.py predict --snapshot 20251022 --tickers AAPL MSFT TSLA
+  python model_b.py build-dataset --snapshot 20251022 --period quarterly
+  python model_b.py train --snapshot 20251022
+  python model_b.py predict --snapshot 20251022 --tickers AAPL MSFT TSLA
 """
 
 from __future__ import annotations
@@ -42,12 +42,54 @@ from dateutil.parser import parse as dtparse
 import lightgbm as lgb
 
 
+# -------- Pretty printing helpers --------
+def _print_rule(char="─", width=72):
+    print(char * width)
+
+def _print_title(title: str, width=72):
+    _print_rule("═", width)
+    print(f"{title}".center(width))
+    _print_rule("═", width)
+
+def _print_subtitle(title: str, width=72):
+    print(f"\n{title}")
+    _print_rule("─", width)
+
+def _to_table(df: pd.DataFrame, max_rows=12, max_cols=8):
+    with pd.option_context("display.max_rows", max_rows, "display.max_columns", max_cols, "display.width", 140):
+        print(df.to_string(index=False))
+
+def _safe_spearman(df: pd.DataFrame, target_col: str, cols: list[str], top_k=12):
+    out = []
+    y = df[target_col].astype(float)
+    for c in cols:
+        s = pd.to_numeric(df[c], errors="coerce")
+        if s.notna().sum() > 20:
+            rho = s.corr(y, method="spearman")
+            if pd.notna(rho):
+                out.append((c, float(rho)))
+    res = (pd.DataFrame(out, columns=["feature","spearman_rho"])
+             .sort_values("spearman_rho", key=lambda s: s.abs(), ascending=False)
+             .head(top_k))
+    return res
+
+def _ensure_reports_dir(snapshot: str) -> Path:
+    rep = MODELS_DIR / snapshot / "reports"
+    rep.mkdir(parents=True, exist_ok=True)
+    return rep
+
+# Pinball loss for quantile tau
+def _pinball_loss(y_true: np.ndarray, y_pred: np.ndarray, tau: float) -> float:
+    e = y_true - y_pred
+    return float(np.mean(np.maximum(tau*e, (tau-1)*e)))
+
+
 # ------------------------------
 # Config
 # ------------------------------
-RAW_DIR = Path(os.environ.get("RAW_DIR", "data-acq/data/raw"))
+RAW_DIR = Path(os.environ.get("RAW_DIR", "data/raw"))
 OUT_DIR = Path("data/structured")
-MODELS_DIR = Path("models/model_a")
+MODELS_DIR = Path("models/model-B")
 LABEL_HORIZON_TRADING_DAYS = 252      # ~12 months
 PUBLICATION_LAG_DAYS = 45             # conservative lag to avoid leakage
 QUANTILES = [0.05, 0.25, 0.50, 0.75, 0.95]
@@ -208,7 +250,18 @@ def _feature_frame(ticker: str, stmts: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     df = inc.merge(bal, on="fiscalDateEnding", how="outer", suffixes=("","_bal"))\
             .merge(csh, on="fiscalDateEnding", how="outer", suffixes=("","_cash"))
 
-       # --- Basic margins (existing) ---
+    # Ensure critical columns exist
+    needed = [
+        "totalRevenue","grossProfit","operatingIncome","netIncome","operatingExpenses",
+        "totalAssets","totalLiabilities","totalShareholderEquity","totalCurrentAssets","totalCurrentLiabilities","longTermDebt",
+        "operatingCashflow","capitalExpenditures"
+    ]
+    for c in needed:
+        if c not in df.columns:
+            df[c] = np.nan
+
+
+    # --- Basic margins (existing) ---
     df["grossMargin"]      = _safe_div(df["grossProfit"], df["totalRevenue"])
     df["operatingMargin"]  = _safe_div(df["operatingIncome"], df["totalRevenue"])
     df["netMargin"]        = _safe_div(df["netIncome"], df["totalRevenue"])
@@ -322,21 +375,6 @@ def _load_prices(tickers: List[str], start: str, end: str) -> pd.DataFrame:
 
     return adj.dropna(how="all")
 
-    """
-    Returns a DataFrame with business-day index and columns = tickers, values = Adj Close.
-    """
-    if not tickers:
-        return pd.DataFrame()
-    data = yf.download(tickers=tickers, start=start, end=end, auto_adjust=False, progress=False, threads=True)
-    # Yahoo returns multi-index if multiple tickers
-    if isinstance(data.columns, pd.MultiIndex):
-        adj = data["Adj Close"].copy()
-    else:
-        adj = data.to_frame()["Adj Close"].copy()
-        adj.columns = [tickers[0]]
-    adj = adj.dropna(how="all")
-    return adj
-
 def _next_trading_day(idx: pd.DatetimeIndex, dt: pd.Timestamp) -> Optional[pd.Timestamp]:
     # find first index >= dt
     loc = idx.searchsorted(dt)
@@ -352,7 +390,8 @@ def _offset_trading_day(idx: pd.DatetimeIndex, dt: pd.Timestamp, offset: int) ->
 def build_dataset(snapshot: str, period: str) -> Path:
     """
     Builds dataset with features and 12m forward return label.
-    Saves to OUT_DIR/<snapshot>/dataset_model_a.parquet
+    Saves to OUT_DIR/<snapshot>/dataset_model_b.parquet
+    Also prints dataset diagnostics and writes CSV reports.
     """
     raw_root = RAW_DIR
     tickers = _list_tickers(raw_root, snapshot)
@@ -374,11 +413,8 @@ def build_dataset(snapshot: str, period: str) -> Path:
     prices = _load_prices(sorted(feats["ticker"].unique()), start, end)
     if prices.empty:
         raise RuntimeError("Failed to load Yahoo prices.")
-    
 
-
-        # --- Price-based momentum & volatility up to as-of date (leakage-safe) ---
-    # daily returns
+    # --- Price-based momentum & volatility up to as-of date (leakage-safe) ---
     rets = prices.pct_change().dropna(how="all")
 
     def past_return(ticker: str, asof_dt: pd.Timestamp, days: int) -> float:
@@ -405,10 +441,10 @@ def build_dataset(snapshot: str, period: str) -> Path:
     feats["vol_3m"]  = [past_vol(t, a, 63)     for t, a in zip(feats["ticker"], feats["asof_date"])]
     feats["vol_6m"]  = [past_vol(t, a, 126)    for t, a in zip(feats["ticker"], feats["asof_date"])]
 
-    # 3) Label each row with 12m forward total return using Adjusted Close (total-return proxy)
+    # 3) Label with 12m forward return
     labels = []
     trade_index = prices.index
-    for i, row in feats.iterrows():
+    for _, row in feats.iterrows():
         t = row["ticker"]
         asof = pd.Timestamp(row["asof_date"]).tz_localize(None)
         t0 = _next_trading_day(trade_index, asof)
@@ -421,11 +457,9 @@ def build_dataset(snapshot: str, period: str) -> Path:
         p1 = prices.at[t1, t]
         if pd.isna(p0) or pd.isna(p1):
             labels.append(np.nan); continue
-        r = float(p1) / float(p0) - 1.0
-        labels.append(r)
+        labels.append(float(p1) / float(p0) - 1.0)
 
-
-    # Light winsorization to tame rare outliers (keeps quantile objective stable)
+    # Light winsorization
     def winsorize(s: pd.Series, p=0.005):
         lo, hi = s.quantile(p), s.quantile(1-p)
         return s.clip(lo, hi)
@@ -435,15 +469,63 @@ def build_dataset(snapshot: str, period: str) -> Path:
         if col in feats.columns:
             feats[col] = winsorize(feats[col])
 
-
     feats["y_12m"] = labels
     feats = feats.dropna(subset=["y_12m"]).reset_index(drop=True)
 
     out_dir = OUT_DIR / snapshot
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "dataset_model_a.parquet"
+    out_path = out_dir / "dataset_model_b.parquet"
     feats.to_parquet(out_path, index=False)
+
+    # --------- Diagnostics (console + CSV) ----------
+    rep = _ensure_reports_dir(snapshot)
+
+    _print_title(f"DATASET SUMMARY — snapshot {snapshot}")
+    # Table 1: basic snapshot stats
+    snap_tbl = pd.DataFrame([{
+        "rows": int(len(feats)),
+        "tickers": int(feats["ticker"].nunique()),
+        "asof_min": feats["asof_date"].min().date(),
+        "asof_max": feats["asof_date"].max().date(),
+        "period": period,
+        "label_horizon_days": LABEL_HORIZON_TRADING_DAYS
+    }])
+    _print_subtitle("Snapshot")
+    _to_table(snap_tbl)
+    snap_tbl.to_csv(rep / "dataset_snapshot.csv", index=False)
+
+    # Table 2: label distribution
+    y = feats["y_12m"].astype(float)
+    label_tbl = pd.DataFrame([{
+        "mean": y.mean(), "std": y.std(), "median": y.median(),
+        "p5": y.quantile(0.05), "p25": y.quantile(0.25), "p75": y.quantile(0.75), "p95": y.quantile(0.95),
+        "share_neg": (y < 0).mean(), "share_<=-20%": (y <= -0.20).mean(), "share_>=+20%": (y >= 0.20).mean()
+    }])
+    _print_subtitle("12-Month Forward Return (Label) — Distribution")
+    _to_table(label_tbl)
+    label_tbl.to_csv(rep / "label_distribution.csv", index=False)
+
+    # Table 3: top missing features
+    miss = feats.drop(columns=["ticker","fiscalDateEnding","asof_date","y_12m"]).isna().mean().sort_values(ascending=False)
+    miss_tbl = miss.head(20).reset_index()
+    miss_tbl.columns = ["feature","missing_rate"]
+    _print_subtitle("Top Missing Features")
+    _to_table(miss_tbl)
+    miss_tbl.to_csv(rep / "feature_missing_rates.csv", index=False)
+
+    # Table 4: quick correlations (Spearman) of select features vs label
+    cand = [c for c in feats.columns if c not in {"ticker","fiscalDateEnding","asof_date","y_12m"}]
+    corr_tbl = _safe_spearman(feats, "y_12m", cand, top_k=15)
+    _print_subtitle("Top |Spearman| Correlations to Target")
+    _to_table(corr_tbl)
+    corr_tbl.to_csv(rep / "spearman_target_corr.csv", index=False)
+
+    _print_rule("═")
+    print(f"Dataset written: {out_path}\nReports: {rep}")
+    _print_rule("═")
+
     return out_path
+
 
 def _feature_target_split(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     target = df["y_12m"].astype(float)
@@ -489,7 +571,7 @@ def _make_pipeline(feature_names: List[str]) -> Pipeline:
     return pipe
 
 def train_models(snapshot: str) -> Dict[str, str]:
-    ds_path = OUT_DIR / snapshot / "dataset_model_a.parquet"
+    ds_path = OUT_DIR / snapshot / "dataset_model_b.parquet"
     if not ds_path.exists():
         raise RuntimeError(f"Dataset not found: {ds_path}. Run build-dataset first.")
     df = pd.read_parquet(ds_path)
@@ -502,18 +584,7 @@ def train_models(snapshot: str) -> Dict[str, str]:
     feature_names = list(X.columns)
 
     pre = _make_pipeline(feature_names)
-    # Clean input (replace inf/-inf, mask absurdly large values, coerce numeric-like objects)
     X_clean = _clean_input_df(X)
-    # Report small diagnostics for debugging
-    # (counts of non-finite values per column)
-    try:
-        nonfinite_counts = X_clean.select_dtypes(include=[np.number]).isna().sum()
-        bad = nonfinite_counts[nonfinite_counts > 0]
-        if not bad.empty:
-            print(f"[INFO] Columns with missing/non-finite after cleaning (showing up to 10): {bad.head(10).to_dict()}")
-    except Exception:
-        pass
-
     Xn = pre.fit_transform(X_clean)
 
     cutoff = int(0.8 * Xn.shape[0])
@@ -523,6 +594,7 @@ def train_models(snapshot: str) -> Dict[str, str]:
     models_paths = {}
     save_dir = MODELS_DIR / snapshot
     save_dir.mkdir(parents=True, exist_ok=True)
+    rep = _ensure_reports_dir(snapshot)
 
     base_params = {
         "objective": "quantile",
@@ -539,10 +611,14 @@ def train_models(snapshot: str) -> Dict[str, str]:
         "metric": "quantile",
     }
 
+    # We’ll store validation predictions from early-stopped boosters to compute metrics
+    val_preds = {}
+
+    _print_title(f"TRAINING — snapshot {snapshot}")
     for tau in QUANTILES:
         params = dict(base_params, alpha=float(tau))
-        dtr = lgb.Dataset(X_tr, label=y_tr)
-        dva = lgb.Dataset(X_va, label=y_va, reference=dtr)
+        dtr = lgb.Dataset(X_tr, label=y_tr, feature_name=feature_names)
+        dva = lgb.Dataset(X_va, label=y_va, reference=dtr, feature_name=feature_names)
 
         booster = lgb.train(
             params, dtr, num_boost_round=5000,
@@ -551,10 +627,12 @@ def train_models(snapshot: str) -> Dict[str, str]:
         )
         best_rounds = booster.best_iteration or 1200
 
+        # Validation prediction from early-stopped model
+        val_preds[tau] = booster.predict(X_va)
+
         # Refit on full
-        dfull = lgb.Dataset(Xn, label=y.values.astype(float))
+        dfull = lgb.Dataset(Xn, label=y.values.astype(float), feature_name=feature_names)
         model = lgb.train(params, dfull, num_boost_round=best_rounds, callbacks=[lgb.log_evaluation(period=0)])
-
         out_path = save_dir / f"lgbm_q{int(tau*100)}.txt"
         model.save_model(str(out_path))
         models_paths[f"{tau:.2f}"] = str(out_path)
@@ -570,131 +648,53 @@ def train_models(snapshot: str) -> Dict[str, str]:
         "features": feature_names,
     }
     (save_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
-    print(f"Saved models to {save_dir}")
+
+    # ---------- Validation Metrics (Tables) ----------
+    # 1) Pinball losses
+    rows = []
+    for tau in QUANTILES:
+        pl = _pinball_loss(y_va, val_preds[tau], float(tau))
+        rows.append({"quantile": tau, "pinball_loss": pl})
+    pin_tbl = pd.DataFrame(rows).sort_values("quantile")
+    _print_subtitle("Validation — Pinball Loss by Quantile")
+    _to_table(pin_tbl)
+    pin_tbl.to_csv(rep / "validation_pinball_loss.csv", index=False)
+
+    # 2) Interval coverage
+    # Build q5..q95 arrays from collected preds
+    qmap = {int(t*100): val_preds[t] for t in QUANTILES}
+    cov_50 = np.mean((y_va >= qmap[25]) & (y_va <= qmap[75])) if 25 in qmap and 75 in qmap else np.nan
+    cov_90 = np.mean((y_va >= qmap[5])  & (y_va <= qmap[95])) if 5 in qmap  and 95 in qmap else np.nan
+    cov_tbl = pd.DataFrame([{"interval":"[25,75] (50%)", "coverage": cov_50},
+                            {"interval":"[5,95] (90%)",  "coverage": cov_90}])
+    _print_subtitle("Validation — Interval Coverage")
+    _to_table(cov_tbl)
+    cov_tbl.to_csv(rep / "validation_interval_coverage.csv", index=False)
+
+    # 3) Feature importance (using full models)
+    imp_rows = []
+    for q in [5,25,50,75,95]:
+        model = lgb.Booster(model_file=str(save_dir / f"lgbm_q{q}.txt"))
+        gains = model.feature_importance(importance_type="gain")
+        imp_df = pd.DataFrame({"feature": feature_names, "gain": gains})
+        imp_df["quantile"] = q
+        imp_rows.append(imp_df)
+    imp_all = pd.concat(imp_rows, ignore_index=True)
+    imp_agg = (imp_all.groupby("feature", as_index=False)
+                      .agg(total_gain=("gain","sum"), avg_gain=("gain","mean"),
+                           q_count=("gain","count"))
+                      .sort_values("total_gain", ascending=False))
+    top_imp = imp_agg.head(25)
+    _print_subtitle("Feature Importance (Gain) — Aggregated Across Quantiles (Top 25)")
+    _to_table(top_imp[["feature","total_gain","avg_gain","q_count"]])
+    imp_all.to_csv(rep / "feature_importance_all.csv", index=False)
+    imp_agg.to_csv(rep / "feature_importance_agg.csv", index=False)
+
+    _print_rule("═")
+    print(f"Saved models to {save_dir}\nReports: {rep}")
+    _print_rule("═")
     return models_paths
 
-    """
-    Train 5 LightGBM quantile models. Saves models and metadata.
-    Returns dict of tau->model_path.
-    """
-    ds_path = OUT_DIR / snapshot / "dataset_model_a.parquet"
-    if not ds_path.exists():
-        raise RuntimeError(f"Dataset not found: {ds_path}. Run build-dataset first.")
-    df = pd.read_parquet(ds_path)
-    if df.shape[0] < 200:
-        print(f"[WARN] Very small dataset ({df.shape[0]} rows). Models will be noisy but we proceed.")
-
-    # Time split: use 'asof_date' for chronological split
-    df = df.sort_values("asof_date").reset_index(drop=True)
-    X, y = _feature_target_split(df)
-    feature_names = list(X.columns)
-
-    # Preprocess (impute)
-    pre = _make_pipeline(feature_names)
-    Xn = pre.fit_transform(X)
-
-    # simple time split: last 20% as validation (we still train models on full after basic sanity)
-    cutoff = int(0.8 * Xn.shape[0])
-    X_train, y_train = Xn[:cutoff], y[:cutoff]
-    X_full,  y_full  = Xn, y
-
-    models_paths = {}
-    save_dir = MODELS_DIR / snapshot
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-        # Time-aware split on asof_date (last 20% = validation)
-    df = df.sort_values("asof_date").reset_index(drop=True)
-    X, y = _feature_target_split(df)
-    feature_names = list(X.columns)
-
-    # Preprocess (impute)
-    pre = _make_pipeline(feature_names)
-    Xn = pre.fit_transform(X)
-
-    cutoff = int(0.8 * Xn.shape[0])
-    X_tr, y_tr = Xn[:cutoff], y.values[:cutoff].astype(float)
-    X_va, y_va = Xn[cutoff:], y.values[cutoff:].astype(float)
-
-    models_paths = {}
-    save_dir = MODELS_DIR / snapshot
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    base_params = {
-        "objective": "quantile",
-        "learning_rate": 0.05,
-        "num_leaves": 127,
-        "min_data_in_leaf": 128,
-        "feature_fraction": 0.8,
-        "bagging_fraction": 0.8,
-        "bagging_freq": 1,
-        "lambda_l1": 1.0,
-        "lambda_l2": 5.0,
-        "verbosity": -1,
-        "seed": RANDOM_STATE,
-        "metric": "quantile",
-    }
-
-    for tau in QUANTILES:
-        params = dict(base_params)
-        params["alpha"] = float(tau)
-
-        dtr = lgb.Dataset(X_tr, label=y_tr)
-        dva = lgb.Dataset(X_va, label=y_va, reference=dtr)
-
-        # Train with early stopping on the time-aware validation
-        booster = lgb.train(
-            params, dtr, num_boost_round=5000,
-            valid_sets=[dtr, dva],
-            valid_names=["train","valid"],
-            callbacks=[lgb.early_stopping(stopping_rounds=300), lgb.log_evaluation(period=0)],
-        )
-        best_rounds = booster.best_iteration or 1200
-
-        # Refit on full data with best rounds
-        dfull = lgb.Dataset(Xn, label=y.values.astype(float))
-        model = lgb.train(params, dfull, num_boost_round=best_rounds, callbacks=[lgb.log_evaluation(period=0)])
-
-        out_path = save_dir / f"lgbm_q{int(tau*100)}.txt"
-        model.save_model(str(out_path))
-        models_paths[f"{tau:.2f}"] = str(out_path)
-
-
-
-    # Train each quantile model
-    for tau in QUANTILES:
-        params = {
-            "objective": "quantile",
-            "alpha": tau,
-            "metric": "quantile",
-            "learning_rate": 0.05,
-            "num_leaves": 31,
-            "min_data_in_leaf": 50,
-            "feature_fraction": 0.8,
-            "bagging_fraction": 0.8,
-            "bagging_freq": 1,
-            "verbosity": -1,
-            "seed": RANDOM_STATE,
-        }
-        dtrain = lgb.Dataset(X_full, label=y_full.values.astype(float))
-        model = lgb.train(params, dtrain, num_boost_round=1200)
-        out_path = save_dir / f"lgbm_q{int(tau*100)}.txt"
-        model.save_model(str(out_path))
-        models_paths[f"{tau:.2f}"] = str(out_path)
-
-    # Save preprocessing and metadata
-    dump(pre, save_dir / "preprocessor.joblib")
-    meta = {
-        "snapshot": snapshot,
-        "created_at": datetime.utcnow().isoformat(),
-        "label_horizon_trading_days": LABEL_HORIZON_TRADING_DAYS,
-        "publication_lag_days": PUBLICATION_LAG_DAYS,
-        "quantiles": QUANTILES,
-        "n_rows": int(df.shape[0]),
-        "features": feature_names,
-    }
-    (save_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
-    print(f"Saved models to {save_dir}")
-    return models_paths
 
 def _enforce_monotonic_quantiles(df: pd.DataFrame, qcols=("q5","q25","q50","q75","q95")) -> pd.DataFrame:
     # Ensure q5 ≤ q25 ≤ q50 ≤ q75 ≤ q95 row-wise
@@ -706,7 +706,8 @@ def _enforce_monotonic_quantiles(df: pd.DataFrame, qcols=("q5","q25","q50","q75"
 def predict_latest(snapshot: str, tickers: List[str], period: str) -> pd.DataFrame:
     """
     Build features for the latest quarter per ticker (in the snapshot),
-    load models, and emit predicted quantiles (+ helpful uncertainty bands).
+    load models, and emit predicted quantiles (+ uncertainty bands).
+    Prints per-ticker table and ranked summary; saves CSVs.
     """
     save_dir = MODELS_DIR / snapshot
     meta_path = save_dir / "metadata.json"
@@ -733,14 +734,12 @@ def predict_latest(snapshot: str, tickers: List[str], period: str) -> pd.DataFra
 
     F = pd.DataFrame(rows).reset_index(drop=True)
 
-    # --- Add price-derived features (moments & vol) to match training dataset ---
+    # --- Add price-derived features to match training ---
     try:
-        # Load prices covering the needed lookback window for all asof dates
         start = (F["asof_date"].min() - pd.Timedelta(days=300)).strftime("%Y-%m-%d")
         end = (F["asof_date"].max() + pd.Timedelta(days=7)).strftime("%Y-%m-%d")
         prices = _load_prices(sorted(F["ticker"].unique()), start, end)
         if prices.empty:
-            # If we couldn't fetch prices, create NaN columns so pipeline can impute
             for c in ["mom_3m", "mom_6m", "mom_12m", "vol_3m", "vol_6m"]:
                 F[c] = np.nan
         else:
@@ -764,37 +763,25 @@ def predict_latest(snapshot: str, tickers: List[str], period: str) -> pd.DataFra
                 r = rets.loc[t_start:t0, ticker].dropna() if ticker in rets.columns else pd.Series(dtype=float)
                 return float(r.std()) if len(r) else np.nan
 
-            F["mom_3m"] = [past_return(t, a, 63) for t, a in zip(F["ticker"], F["asof_date"]) ]
-            F["mom_6m"] = [past_return(t, a, 126) for t, a in zip(F["ticker"], F["asof_date"]) ]
-            F["mom_12m"] = [past_return(t, a, 252) for t, a in zip(F["ticker"], F["asof_date"]) ]
-            F["vol_3m"] = [past_vol(t, a, 63) for t, a in zip(F["ticker"], F["asof_date"]) ]
-            F["vol_6m"] = [past_vol(t, a, 126) for t, a in zip(F["ticker"], F["asof_date"]) ]
+            F["mom_3m"]  = [past_return(t, a, 63)  for t, a in zip(F["ticker"], F["asof_date"])]
+            F["mom_6m"]  = [past_return(t, a, 126) for t, a in zip(F["ticker"], F["asof_date"])]
+            F["mom_12m"] = [past_return(t, a, 252) for t, a in zip(F["ticker"], F["asof_date"])]
+            F["vol_3m"]  = [past_vol(t, a, 63)     for t, a in zip(F["ticker"], F["asof_date"])]
+            F["vol_6m"]  = [past_vol(t, a, 126)    for t, a in zip(F["ticker"], F["asof_date"])]
     except Exception:
-        # On any failure, add the columns as NaN so preprocessor can still run
         for c in ["mom_3m", "mom_6m", "mom_12m", "vol_3m", "vol_6m"]:
             if c not in F.columns:
                 F[c] = np.nan
 
-    # Ensure feature order exactly matches training
     missing = [c for c in feature_names if c not in F.columns]
     if missing:
         raise RuntimeError(f"Missing required features in latest frame: {missing[:10]}{'...' if len(missing)>10 else ''}")
 
     X = F[feature_names].copy()
     X_clean = _clean_input_df(X)
-    # If any non-finite remain in numeric columns, show counts to help debugging
-    try:
-        nf = (~np.isfinite(X_clean.select_dtypes(include=[np.number]).to_numpy())).sum(axis=0)
-        cols = X_clean.select_dtypes(include=[np.number]).columns
-        bad = {c: int(n) for c, n in zip(cols, nf) if n > 0}
-        if bad:
-            print(f"[WARN] Non-finite values detected in latest features prior to transform: {dict(list(bad.items())[:10])}")
-    except Exception:
-        pass
-
     Xn = pre.transform(X_clean)
 
-    # Load each quantile model and predict
+    # Load quantile models and predict
     preds: Dict[str, np.ndarray] = {}
     needed = {5, 25, 50, 75, 95}
     for q in sorted(needed):
@@ -805,24 +792,118 @@ def predict_latest(snapshot: str, tickers: List[str], period: str) -> pd.DataFra
         preds[f"q{q}"] = model.predict(Xn)
 
     out = F[["ticker","asof_date"]].copy()
-    # Attach in canonical order
     for k in ["q5","q25","q50","q75","q95"]:
         out[k] = preds[k]
-
-    # Enforce monotonic quantiles (prevents crossings from separate models)
     out = _enforce_monotonic_quantiles(out, ("q5","q25","q50","q75","q95"))
+    out["iqr_width"] = out["q75"] - out["q25"]
+    out["p90_width"] = out["q95"] - out["q5"]
+    out["median"]    = out["q50"]
+    out["asof_date"] = pd.to_datetime(out["asof_date"])
 
-    # Add uncertainty bands for quick inspection
-    out["iqr_width"]   = out["q75"] - out["q25"]         # 50% interval
-    out["p90_width"]   = out["q95"] - out["q5"]          # 90% interval
-    out["median"]      = out["q50"]                      # alias
-    out["asof_date"]   = pd.to_datetime(out["asof_date"])  # ensure dtype
+    # Console tables
+    _print_title(f"PREDICTIONS — snapshot {snapshot}")
+    _print_subtitle("Per-Ticker Quantile Prediction (12m Ret)")
+    show_cols = ["ticker","asof_date","q5","q25","q50","q75","q95","iqr_width","p90_width"]
+    _to_table(out[show_cols].sort_values("ticker"))
 
-    # Optional: clip if your target is bounded (example: returns ≥ -1)
-    # out[["q5","q25","q50","q75","q95"]] = out[["q5","q25","q50","q75","q95"]].clip(lower=-1.0)
+    ranked = (out[["ticker","median","iqr_width","p90_width"]]
+                .sort_values(["median","iqr_width"], ascending=[False, True])
+                .reset_index(drop=True))
 
-    print((np.diff(out.loc[out["ticker"]=="MSFT", ["q5","q25","q50","q75","q95"]].values) >= 0).all())
+    _print_rule("─")
+    _print_subtitle("Top 5 Ranked by Median Return (Risk-Adjusted)")
+    _to_table(ranked.head(5))
+    
+    # Save
+    out_path = save_dir / "predictions_latest.csv"
+    out.to_csv(out_path, index=False)
+    print(f"\nSaved predictions to: {out_path}")
+    return out
 
+
+# ==============================================================================
+# Public API for Dashboard / Simulations (Cached Loading & Inference)
+# ==============================================================================
+
+def load_resources(snapshot: str) -> Dict[str, Any]:
+    """
+    Loads all model artifacts once for high-performance inference in Streamlit.
+    Returns a dict with: 'meta', 'preprocessor', 'models' (dict of boosters).
+    """
+    save_dir = MODELS_DIR / snapshot
+    meta_path = save_dir / "metadata.json"
+    pre_path  = save_dir / "preprocessor.joblib"
+    
+    if not meta_path.exists() or not pre_path.exists():
+        raise RuntimeError(f"Artifacts not found for snapshot {snapshot}")
+
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    pre = load(pre_path)
+    
+    models = {}
+    needed = {5, 25, 50, 75, 95}
+    for q in needed:
+        model_path = save_dir / f"lgbm_q{q}.txt"
+        if not model_path.exists():
+            continue
+        models[q] = lgb.Booster(model_file=str(model_path))
+        
+    return {
+        "meta": meta,
+        "preprocessor": pre,
+        "models": models,
+        "feature_names": meta["features"]
+    }
+
+def predict_on_features(resources: Dict[str, Any], X: pd.DataFrame) -> pd.DataFrame:
+    """
+    Run inference on a custom feature set X using loaded resources.
+    X must contain columns matching resources['feature_names'].
+    Returns DataFrame with q5, q25, q50, q75, q95 columns.
+    """
+    pre = resources["preprocessor"]
+    models = resources["models"]
+    feats = resources["feature_names"]
+    
+    # Ensure alignment
+    # If X has extra columns, ignore them. If missing, this will error (correctly).
+    X_in = X[feats].copy()
+    
+    # Preprocessing (clean + transform)
+    X_clean = _clean_input_df(X_in)
+    Xn = pre.transform(X_clean)
+    
+    # Predict
+    out = pd.DataFrame(index=X.index)
+    for q, booster in models.items():
+        out[f"q{q}"] = booster.predict(Xn)
+        
+    # Enforce monotonicity
+    cols = [f"q{q}" for q in sorted(models.keys())]
+    if len(cols) > 1:
+        arr = out[cols].values
+        arr.sort(axis=1)
+        out[cols] = arr
+        
+    return out
+
+    # Quality flags
+    iq_med = ranked["iqr_width"].median()
+    ranked["uncertainty_flag"] = np.where(ranked["iqr_width"] <= 0.5*iq_med, "narrow",
+                                 np.where(ranked["iqr_width"] >= 1.5*iq_med, "wide", "normal"))
+    _print_subtitle("Ranked Summary (by median; narrower IQR preferred)")
+    _to_table(ranked.head(20))
+
+    # Save CSVs
+    rep = _ensure_reports_dir(snapshot)
+    out.to_csv(rep / "predict_latest_full.csv", index=False)
+    ranked.to_csv(rep / "predict_ranked.csv", index=False)
+
+    # quick monotonicity sanity print for MSFT if present
+    try:
+        print("\nMonotone check (MSFT):", (np.diff(out.loc[out["ticker"]=="MSFT", ["q5","q25","q50","q75","q95"]].values) >= 0).all())
+    except Exception:
+        pass
 
     return out[["ticker","asof_date","q5","q25","q50","q75","q95","iqr_width","p90_width","median"]]
 
@@ -831,7 +912,7 @@ def predict_latest(snapshot: str, tickers: List[str], period: str) -> pd.DataFra
 # CLI
 # ------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Model A (Quantile GBM): build dataset, train, predict.")
+    ap = argparse.ArgumentParser(description="Model B (Quantile GBM + diagnostics): build dataset, train, predict.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     b = sub.add_parser("build-dataset", help="Build dataset from raw fundamentals + Yahoo labels")
